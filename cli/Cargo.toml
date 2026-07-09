@@ -1,0 +1,22 @@
+[package]
+name = "sentinel-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sentinel"
+path = "src/main.rs"
+
+[dependencies]
+sentinel-core.workspace = true
+sentinel-browser.workspace = true
+sentinel-ai.workspace = true
+sentinel-store.workspace = true
+
+[lints]
+workspace = true
