@@ -33,7 +33,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain pinned in rust-toolchain.toml; rustup auto-installs on first cargo use.
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --bin sentinel
 

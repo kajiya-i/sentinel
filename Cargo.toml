@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/browser",
+    "crates/ai",
+    "crates/store",
+    "cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kajiya-i/sentinel"
+authors = ["The Sentinel Authors"]
+# MVP ships as a single binary, not crates.io packages. Keeping the crates
+# unpublished lets the internal path deps stay version-less (no per-release bump
+# churn) and satisfies cargo-deny's allow-wildcard-paths. Flip per-crate if we
+# ever publish to crates.io.
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# External dependency versions are centralized here as crates start needing them (M1+).
+# For now the skeleton has no external dependencies; only the internal path deps are wired.
+[workspace.dependencies]
+sentinel-core = { path = "crates/core" }
+sentinel-browser = { path = "crates/browser" }
+sentinel-ai = { path = "crates/ai" }
+sentinel-store = { path = "crates/store" }
