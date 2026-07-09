@@ -1,0 +1,113 @@
+name: Feature Request
+description: Suggest a new feature or improvement
+title: "[Feature]: "
+labels: ["T-Feature"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting a feature! Please provide enough information to evaluate and prioritize it.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A concise description of the feature in 1-2 sentences.
+      placeholder: Add a `select` action so scenarios can choose a dropdown option before evidence capture.
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: What problem does this solve? Who benefits?
+      placeholder: |
+        Some error states are only reachable after selecting an option. Without a `select` action
+        those screens can't be arranged declaratively.
+    validations:
+      required: true
+
+  - type: textarea
+    id: detailed_description
+    attributes:
+      label: Detailed Description
+      description: Desired behavior, config/API shape, edge cases.
+      placeholder: |
+        A `select` action in the scenario `actions` list:
+        ```yaml
+        actions:
+          - select: { target: "Country", value: "Japan" }
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Other approaches you tried or considered.
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Links to docs, related issues, or prior art (e.g. docs/specs/scenarios.md).
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: How important is this to you?
+      options:
+        - Low - Nice to have
+        - Medium - Would improve my workflow
+        - High - Blocking my use case
+      default: 0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: target_area
+    attributes:
+      label: Target Area
+      description: Which component would this touch?
+      options:
+        - core (domain / orchestration)
+        - browser (chromiumoxide adapter / actions / evidence)
+        - ai (Claude judgment)
+        - config (sentinel.yaml / check YAML / scenarios)
+        - cli
+        - report
+        - eval / accuracy
+        - store (Post-MVP)
+        - server (Post-MVP)
+        - New component
+        - Unknown
+      default: 10
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to help implement this feature
+          required: false
+        - label: I can provide test cases / eval fixtures
+          required: false
+        - label: I can help with documentation
+          required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: I have searched existing issues to ensure this is not a duplicate
+          required: true
+        - label: I have checked the roadmap (docs/roadmap/) to see if this is already planned
+          required: false
+        - label: This aligns with the project's goal (verify that a UI matches its spec under any condition)
+          required: false

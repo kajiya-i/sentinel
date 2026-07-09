@@ -1,0 +1,67 @@
+name: Release
+
+# Builds the `sentinel` CLI as a single binary for each platform and attaches
+# the archives to a GitHub Release. Triggered by pushing a version tag
+# (e.g. v0.1.0), or manually via workflow_dispatch.
+#
+# NOTE: assumes the CLI produces a `sentinel` binary — confirm the bin name at M0
+# (T-M0-01). crates.io publishing is intentionally not wired up yet (MVP ships as
+# a binary; publishing is a later decision).
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub Release + upload assets
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: sentinel-linux-x86_64.tar.gz
+          - os: macos-latest
+            asset: sentinel-macos-aarch64.tar.gz
+          - os: windows-latest
+            asset: sentinel-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin sentinel
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: tar -czf "${{ matrix.asset }}" -C target/release sentinel
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path target/release/sentinel.exe -DestinationPath "${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --title "$TAG" --generate-notes dist/*

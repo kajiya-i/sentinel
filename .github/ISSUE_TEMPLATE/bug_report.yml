@@ -1,0 +1,108 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+title: "[Bug]: "
+labels: ["T-Bug"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug! Please provide enough detail to reproduce and fix it.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A concise description of the bug in 1-2 sentences.
+      placeholder: "`sentinel check` panics on a timeout scenario instead of recording verdict=error."
+    validations:
+      required: true
+
+  - type: textarea
+    id: current_behavior
+    attributes:
+      label: Current Behavior
+      description: What is currently happening?
+      placeholder: |
+        Running a scenario that delays the API returns a crash instead of a `needs_review`/`error`
+        verdict; the whole suite run aborts.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected Behavior
+      description: What should happen instead?
+      placeholder: |
+        The check should record `verdict = error` (execution failure) and the rest of the suite
+        should continue.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: The check YAML / command that reproduces the issue.
+      placeholder: |
+        ```yaml
+        # repro.yaml
+        url: https://example.com/orders
+        scenarios:
+          - name: timeout
+            mock: [{ url: "**/api/orders", delay_ms: 30000 }]
+            spec: shows a timeout message
+        ```
+        Then run: `sentinel check repro.yaml`
+    validations:
+      required: true
+
+  - type: textarea
+    id: error_output
+    attributes:
+      label: Error Output / Backtrace
+      description: Error messages, panics, or backtraces (`RUST_BACKTRACE=1`). Include the JSON report if relevant.
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: Sentinel Version
+      description: Output of `sentinel --version` (or the commit SHA).
+      placeholder: "0.1.0 / <sha>"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Your environment.
+      placeholder: |
+        - OS: Ubuntu 24.04 / macOS 15 / Windows 11
+        - Rust: rustc 1.xx (output of `rustc --version`)
+        - Chrome/Chromium: 12x (output of `google-chrome --version`)
+        - Architecture: x86_64 / aarch64
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Anything else helpful (target site type SPA/SSR, related issues, workarounds).
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: I have searched existing issues to ensure this is not a duplicate
+          required: true
+        - label: I have provided a minimal reproduction (check YAML / command)
+          required: true
+        - label: This report contains no secrets (API keys) or private data (screenshots/DOM with PII)
+          required: true
