@@ -3,3 +3,7 @@
 
 ## private session file
 SESSION.md
+
+## private claude files
+/.claude/
+CLAUDE.md
