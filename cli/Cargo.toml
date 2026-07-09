@@ -17,6 +17,8 @@ sentinel-core.workspace = true
 sentinel-browser.workspace = true
 sentinel-ai.workspace = true
 sentinel-store.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
