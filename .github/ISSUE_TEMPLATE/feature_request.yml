@@ -54,7 +54,7 @@ body:
     id: references
     attributes:
       label: References
-      description: Links to docs, related issues, or prior art (e.g. docs/specs/scenarios.md).
+      description: Related issues, external references, or prior art.
 
   - type: dropdown
     id: priority
@@ -107,7 +107,7 @@ body:
       options:
         - label: I have searched existing issues to ensure this is not a duplicate
           required: true
-        - label: I have checked the roadmap (docs/roadmap/) to see if this is already planned
+        - label: I have checked existing issues to see if this is already planned
           required: false
         - label: This aligns with the project's goal (verify that a UI matches its spec under any condition)
           required: false

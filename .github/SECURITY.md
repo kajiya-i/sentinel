@@ -29,7 +29,7 @@ Sentinel drives a headless browser against target URLs and sends collected evide
 AI provider. Security-relevant areas include:
 
 - **Target-URL handling / SSRF** — Sentinel opens URLs; server-side deployments must guard
-  against internal/metadata endpoints (see `docs/rules/security.md`).
+  against internal/metadata endpoints.
 - **Secrets** — the AI provider API key (`ANTHROPIC_API_KEY`) must never be logged or leaked.
 - **Captured data** — screenshots / DOM may contain PII; retention and access matter.
 

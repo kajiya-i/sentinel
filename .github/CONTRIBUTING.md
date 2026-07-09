@@ -76,7 +76,7 @@ Issues and PRs use a prefix system. Each label belongs to one family:
 
 - `S-Ready-For-Implementation` means the design is settled — safe to start a PR.
   `S-Needs-Design` means it needs discussion first.
-- Work is grouped by milestone (M0–M6 for the MVP); see [`docs/roadmap/README.md`](../docs/roadmap/README.md).
+- Work is grouped by milestone (M0–M6 for the MVP).
 
 ---
 
@@ -138,13 +138,12 @@ cargo doc --workspace --no-deps
 cargo deny check   # license + advisory policy
 ```
 
-Key rules (see [`docs/rules/`](../docs/rules/rust.md)):
+Key rules:
 
-- **No handwritten `unsafe`** — the workspace sets `unsafe_code = "forbid"` ([`unsafe.md`](../docs/rules/unsafe.md)).
-- `unwrap()` / `expect()` are disallowed in production code — use `?` / typed errors
-  ([`error-handling.md`](../docs/rules/error-handling.md)).
+- **No handwritten `unsafe`** — the workspace sets `unsafe_code = "forbid"`.
+- `unwrap()` / `expect()` are disallowed in production code — use `?` / typed errors.
 - No panics on the check-execution path; isolate failures as `verdict = error`.
-- Never log secrets (API key) or raw screenshots/DOM ([`logging.md`](../docs/rules/logging.md), [`security.md`](../docs/rules/security.md)).
+- Never log secrets (the API key) or raw screenshots/DOM (they may contain PII).
 
 ---
 
@@ -157,30 +156,19 @@ cargo test --workspace
 - **AI is mocked** (e.g. wiremock) — never hit the real API in CI.
 - **Browser tests** run against local HTML fixtures with a real headless Chrome, and **skip**
   when no browser is available.
-- Non-trivial logic ships with a test; naming: `<feature>_should_<expected_result>`
-  (see [`testing.md`](../docs/rules/testing.md)).
+- Non-trivial logic ships with a test; naming: `<feature>_should_<expected_result>`.
 
 ---
 
 ## Documentation
 
 Public items should have rustdoc comments (one-line summary + a short example when non-obvious).
-Design lives in [`docs/specs/`](../docs/specs/overview.md); conventions in [`docs/rules/`](../docs/rules/rust.md).
-
----
-
-## Project Docs
-
-- **Concept / vision**: [`docs/concepts.md`](../docs/concepts.md)
-- **Specs**: [`docs/specs/`](../docs/specs/overview.md) (architecture, core-mechanism, scenarios, ai-judgment, accuracy, …)
-- **Rules**: [`docs/rules/`](../docs/rules/rust.md) (rust, design, error-handling, logging, testing, security, prompting, dependencies, database, unsafe)
-- **Roadmap**: [`docs/roadmap/`](../docs/roadmap/README.md) (MVP milestones M0–M6)
 
 ---
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the project license:
-**Apache-2.0**. Sign off your commits (DCO) to certify you have the right to submit them.
+By contributing, you agree that your contributions are dual-licensed under the project license:
+**MIT OR Apache-2.0**. Sign off your commits (DCO) to certify you have the right to submit them.
 
-See [LICENSE](../LICENSE) for details.
+See [LICENSE-MIT](../LICENSE-MIT) and [LICENSE-APACHE](../LICENSE-APACHE) for details.
