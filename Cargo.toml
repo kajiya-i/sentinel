@@ -34,3 +34,6 @@ sentinel-store = { path = "crates/store" }
 # Logging: the `cli` owns subscriber init; libraries only emit events (docs/rules/logging.md).
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Typed errors for library crates (docs/rules/error-handling.md). `anyhow` is cli-only.
+thiserror = "2.0.18"
