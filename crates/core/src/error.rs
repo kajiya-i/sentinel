@@ -42,6 +42,8 @@ pub enum BrowserError {
     Timeout { target: String, ms: u64 },
     #[error("element not found: {target}")]
     ElementNotFound { target: String },
+    #[error("unsupported url scheme: {scheme} (only http/https/data allowed)")]
+    UnsupportedScheme { scheme: String },
     #[error("cdp protocol error: {0}")]
     Protocol(String),
 }
