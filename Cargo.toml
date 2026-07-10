@@ -43,3 +43,8 @@ thiserror = "2.0.18"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_norway = "0.9.42"
 url = "2.5.8"
+
+# Port traits: async_trait for dyn-safe/Send async ports (docs/rules/design.md §1).
+# tokio is a dev-dependency for now (async tests); it becomes a real core dep with M1 orchestration.
+async-trait = "0.1.89"
+tokio = { version = "1.52.3", features = ["macros", "rt"] }

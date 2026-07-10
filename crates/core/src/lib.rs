@@ -5,11 +5,12 @@
 //! `Reporter`). Adapters (`sentinel-browser`, `sentinel-ai`, `sentinel-store`) depend on
 //! this crate and implement its ports; `core` stays free of adapter-specific dependencies.
 //!
-//! Port traits and orchestration arrive in later M0 tasks (T-M0-09 onward).
+//! Judgment orchestration (driving the ports) arrives with the M1 walking skeleton.
 
 mod config;
 mod domain;
 mod error;
+mod ports;
 
 pub use config::{Defaults, ProjectConfig, Retry, ViewportDto, load_check};
 pub use domain::{
@@ -17,3 +18,4 @@ pub use domain::{
     Threshold, Verdict, Viewport, Violation,
 };
 pub use error::{AiError, BrowserError, ConfigError, RunError, StoreError};
+pub use ports::{Browser, Judge, Reporter, Store};
