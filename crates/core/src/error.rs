@@ -23,6 +23,10 @@ pub enum ConfigError {
     ThresholdRange(f32),
     #[error("invalid target selector: {0}")]
     InvalidTarget(String),
+    #[error("invalid or unresolvable url: {url}")]
+    InvalidUrl { url: String },
+    #[error("invalid check {name}: {reason}")]
+    Invalid { name: String, reason: String },
 }
 
 /// Browser (CDP) failures. Adapter-agnostic: chromiumoxide errors are mapped into

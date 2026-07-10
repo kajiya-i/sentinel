@@ -10,6 +10,9 @@ publish.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+serde.workspace = true
+serde_norway.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true
