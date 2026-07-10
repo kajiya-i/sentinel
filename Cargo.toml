@@ -48,3 +48,11 @@ url = "2.5.8"
 # tokio is a dev-dependency for now (async tests); it becomes a real core dep with M1 orchestration.
 async-trait = "0.1.89"
 tokio = { version = "1.52.3", features = ["macros", "rt"] }
+
+# Browser adapter (CDP). `futures` drives the chromiumoxide handler stream; `serde_json`
+# serializes the raw accessibility tree. chromiumoxide's only default feature is `bytes`
+# (makes screenshots return `bytes::Bytes`); disabling it keeps `Vec<u8>` and pulls nothing
+# extra. The tokio runtime is unconditional, so this does not affect it.
+chromiumoxide = { version = "0.9.1", default-features = false }
+futures = "0.3.32"
+serde_json = "1.0.150"
