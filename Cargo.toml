@@ -37,3 +37,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Typed errors for library crates (docs/rules/error-handling.md). `anyhow` is cli-only.
 thiserror = "2.0.18"
+
+# Config: serde DTOs + maintained YAML fork (serde_yaml is unmaintained, RUSTSEC-2024-0370).
+# `url` resolves relative check URLs against `defaults.base_url` at the config boundary.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_norway = "0.9.42"
+url = "2.5.8"
