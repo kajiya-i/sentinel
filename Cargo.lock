@@ -813,6 +813,7 @@ name = "sentinel-browser"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chromiumoxide",
  "futures",
  "sentinel-core",

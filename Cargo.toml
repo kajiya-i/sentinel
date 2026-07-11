@@ -56,3 +56,5 @@ tokio = { version = "1.52.3", features = ["macros", "rt"] }
 chromiumoxide = { version = "0.9.1", default-features = false }
 futures = "0.3.32"
 serde_json = "1.0.150"
+# base64-encode mocked response bodies for CDP Fetch.fulfillRequest.
+base64 = "0.22.1"
