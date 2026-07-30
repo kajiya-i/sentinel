@@ -1247,6 +1247,7 @@ dependencies = [
  "sentinel-browser",
  "sentinel-core",
  "sentinel-store",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
