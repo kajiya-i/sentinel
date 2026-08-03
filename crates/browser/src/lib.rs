@@ -5,6 +5,8 @@
 //! path — action execution, condition arrangement (Fetch interception), a11y pruning, precise
 //! viewport sizing, and full auto-wait land in M2–M3.
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -33,26 +35,78 @@ pub struct MockRule {
     pub status: u16,
 }
 
+/// How to launch Chrome for a run (docs/roadmap/M2-browser-evidence.md — T-M2-01).
+///
+/// `#[non_exhaustive]`: more knobs (viewport, launch timeout, …) will be added without breaking
+/// callers — construct via `LaunchOptions { .. }` update syntax or `..Default::default()`
+/// (docs/rules/design.md §2).
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct LaunchOptions {
+    /// Explicit Chrome/Chromium executable. `None` auto-detects from the system
+    /// (docs/specs/architecture.md — `--chrome-path`).
+    pub chrome_path: Option<PathBuf>,
+    /// Sandbox policy; see [`SandboxPolicy`].
+    pub sandbox: SandboxPolicy,
+}
+
+/// Chrome sandbox control. Defaults to [`SandboxPolicy::Enabled`]: the browser opens untrusted
+/// pages, so the OS sandbox stays on (docs/rules/security.md §4 — minimal privilege).
+/// [`SandboxPolicy::Disabled`] adds `--no-sandbox`, which is required under root/containers where
+/// the sandbox can't initialize but removes a real isolation layer — hence an explicit opt-out
+/// only. Wiring it to a user-facing flag / config is M5 (T-M5-01).
+///
+/// `#[non_exhaustive]`: a future `Auto` (disable under root/containers automatically) is likely
+/// (docs/rules/design.md §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SandboxPolicy {
+    /// Sandbox on (secure default).
+    #[default]
+    Enabled,
+    /// Sandbox off (`--no-sandbox`) for root/container environments.
+    Disabled,
+}
+
 /// A launched Chrome instance driven over CDP. Reused across checks (each check gets its own
 /// page); the CDP event loop runs in a spawned task for the browser's lifetime.
 pub struct ChromiumBrowser {
     browser: CdpBrowser,
     // The handler stream must be polled continuously or every CDP call stalls; keep the task
-    // alive for the browser's lifetime.
-    _handler_task: tokio::task::JoinHandle<()>,
+    // alive for the browser's lifetime and abort it in `close`.
+    handler_task: tokio::task::JoinHandle<()>,
 }
 
 impl ChromiumBrowser {
-    /// Launch a headless Chrome (auto-detected from the system) and start its CDP event loop.
-    pub async fn launch() -> Result<Self, BrowserError> {
-        let config = BrowserConfig::builder()
-            .build()
-            .map_err(BrowserError::Protocol)?;
-        // Preserve the real cause (missing binary, sandbox denial, launch timeout, …) rather
-        // than collapsing every failure to `ChromeNotFound`, which hides root causes in CI.
+    /// Launch a headless Chrome and start its CDP event loop. The executable is auto-detected
+    /// from the system unless [`LaunchOptions::chrome_path`] overrides it; the sandbox stays on
+    /// unless [`LaunchOptions::sandbox`] opts out. Reuse one instance per run — each check gets
+    /// its own page (docs/rules/perf.md).
+    pub async fn launch(options: LaunchOptions) -> Result<Self, BrowserError> {
+        let mut builder = BrowserConfig::builder();
+        if let Some(ref path) = options.chrome_path {
+            // A missing explicit binary is a detection failure. A path that *exists* but won't
+            // launch (e.g. sandbox denial under root, port conflict, CDP handshake) is NOT
+            // "not found" — it surfaces below with its real cause, so the operator is pointed at
+            // `--no-sandbox` instead of a misleading "chrome not found".
+            if !path.exists() {
+                return Err(BrowserError::ChromeNotFound);
+            }
+            builder = builder.chrome_executable(path);
+        }
+        if options.sandbox == SandboxPolicy::Disabled {
+            builder = builder.no_sandbox();
+        }
+        // `build` runs Chrome auto-detection when no explicit path is set; its only failure mode
+        // is "no Chrome found" — a typed detection failure (docs/roadmap/M2 — T-M2-01).
+        let config = builder.build().map_err(|_| BrowserError::ChromeNotFound)?;
+
+        // Preserve the real launch cause (sandbox denial, launch timeout, CDP handshake, …)
+        // rather than collapsing it to `ChromeNotFound`, which hides root causes (RK-005).
         let (browser, mut handler) = CdpBrowser::launch(config)
             .await
             .map_err(|e| BrowserError::Protocol(format!("chrome launch failed: {e}")))?;
+
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
                 if event.is_err() {
@@ -62,8 +116,22 @@ impl ChromiumBrowser {
         });
         Ok(Self {
             browser,
-            _handler_task: handler_task,
+            handler_task,
         })
+    }
+
+    /// Shut the browser down cleanly at the end of a run. Best-effort — errors are logged, not
+    /// returned. Order matters (RK-005): `close` needs the handler task still polling to receive
+    /// the CDP response; `wait` then reaps the child process (so chromiumoxide's `Browser::drop`
+    /// sees it exited and doesn't warn "not closed manually" / fall back to `kill_on_drop`);
+    /// only then is the handler task aborted.
+    pub async fn close(mut self) {
+        if let Err(e) = self.browser.close().await {
+            tracing::warn!(error = %e, "browser close failed");
+        }
+        // `wait` awaits the child directly and doesn't need the handler task.
+        let _ = self.browser.wait().await;
+        self.handler_task.abort();
     }
 }
 
@@ -265,20 +333,42 @@ mod tests {
         }
     }
 
+    /// Bound a browser call so a stalled CDP request fails the test instead of hanging CI
+    /// (docs/rules/testing.md; #58). `wait_for_navigation` has no timeout of its own — RK-003.
+    const CDP_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn launch_should_type_error_for_bogus_chrome_path() {
+        // No Chrome needed: an explicit non-existent path is stored, then the spawn fails, and
+        // the failure is mapped to a typed `ChromeNotFound` (never a panic). Covers #57's path
+        // override + #15's "detection failure is typed".
+        let options = LaunchOptions {
+            chrome_path: Some(PathBuf::from("/nonexistent/definitely-not-chrome")),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ChromiumBrowser::launch(options).await,
+            Err(BrowserError::ChromeNotFound)
+        ));
+    }
+
     #[tokio::test]
     async fn collect_evidence_should_capture_png_and_a11y() {
         // Browser test: skip gracefully when no Chrome is available (docs/rules/testing.md).
-        let Ok(browser) = ChromiumBrowser::launch().await else {
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
             eprintln!("skipping: no chrome available");
             return;
         };
         let check = fixture_check(
             "data:text/html,<html><body><button>Submit</button><h1>Hello</h1></body></html>",
         );
-        let evidence = browser
-            .collect_evidence(&check, &check.scenarios[0])
-            .await
-            .expect("evidence captured");
+        let evidence = tokio::time::timeout(
+            CDP_TEST_TIMEOUT,
+            browser.collect_evidence(&check, &check.scenarios[0]),
+        )
+        .await
+        .expect("collect_evidence timed out")
+        .expect("evidence captured");
 
         assert!(
             evidence
@@ -290,11 +380,13 @@ mod tests {
         let a11y = evidence.a11y_tree.to_lowercase();
         assert!(a11y.contains("button"), "a11y tree missing the button role");
         assert!(a11y.contains("submit"), "a11y tree missing the button name");
+
+        browser.close().await;
     }
 
     #[tokio::test]
     async fn collect_with_mocks_should_render_mocked_500() {
-        let Ok(browser) = ChromiumBrowser::launch().await else {
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
             eprintln!("skipping: no chrome available");
             return;
         };
@@ -309,10 +401,13 @@ mod tests {
             url_substring: "orders.api.invalid/orders".to_string(),
             status: 500,
         }];
-        let evidence = browser
-            .collect_with_mocks(&check, &check.scenarios[0], &mocks)
-            .await
-            .expect("evidence captured");
+        let evidence = tokio::time::timeout(
+            CDP_TEST_TIMEOUT,
+            browser.collect_with_mocks(&check, &check.scenarios[0], &mocks),
+        )
+        .await
+        .expect("collect_with_mocks timed out")
+        .expect("evidence captured");
 
         let a11y = evidence.a11y_tree.to_lowercase();
         assert!(
@@ -325,5 +420,34 @@ mod tests {
                 .starts_with(&[0x89, b'P', b'N', b'G']),
             "screenshot is not a PNG"
         );
+
+        browser.close().await;
+    }
+
+    #[tokio::test]
+    async fn collect_should_reuse_browser_across_multiple_pages() {
+        // One instance per run, a fresh page per check (docs/rules/perf.md; #15 reuse).
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
+            eprintln!("skipping: no chrome available");
+            return;
+        };
+        for html in ["<h1>One</h1>", "<h1>Two</h1>"] {
+            let check = fixture_check(&format!("data:text/html,{html}"));
+            let evidence = tokio::time::timeout(
+                CDP_TEST_TIMEOUT,
+                browser.collect_evidence(&check, &check.scenarios[0]),
+            )
+            .await
+            .expect("collect_evidence timed out")
+            .expect("evidence captured");
+            assert!(
+                evidence
+                    .screenshot_png
+                    .starts_with(&[0x89, b'P', b'N', b'G']),
+                "screenshot is not a PNG"
+            );
+        }
+
+        browser.close().await;
     }
 }

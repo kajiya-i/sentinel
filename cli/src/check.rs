@@ -9,7 +9,7 @@
 //! M5 (T-M5-04).
 
 use sentinel_ai::ClaudeJudge;
-use sentinel_browser::{ChromiumBrowser, MockRule};
+use sentinel_browser::{ChromiumBrowser, LaunchOptions, MockRule};
 use sentinel_core::{
     Check, CheckId, CheckResult, Judge, RunError, Scenario, TargetUrl, Threshold, Verdict, Viewport,
 };
@@ -56,8 +56,14 @@ async fn run(api_key: &str) -> Result<CheckResult, RunError> {
     // The abnormal state (API → 500) is arranged via the concrete browser API: mock/precondition
     // wiring isn't on the `Browser` port yet (Scenario → mock is M3, T-M3-05), and the CLI is the
     // composition root that may use richer adapter methods.
-    let browser = ChromiumBrowser::launch().await?;
-    let evidence = browser.collect_with_mocks(&check, scenario, &mocks).await?;
+    // Launch once per run (default: auto-detect Chrome, sandbox on). User-facing chrome-path /
+    // sandbox control is M5 (T-M5-01); the adapter is already configurable.
+    let browser = ChromiumBrowser::launch(LaunchOptions::default()).await?;
+    let evidence = browser.collect_with_mocks(&check, scenario, &mocks).await;
+    // Close before judging (the browser isn't needed past evidence collection) so it shuts down
+    // cleanly even when collection failed — no "not closed manually" warning, no lingering child.
+    browser.close().await;
+    let evidence = evidence?;
 
     let judge = ClaudeJudge::new(api_key);
     let judgment = judge.judge(&scenario.spec, &evidence).await?;
