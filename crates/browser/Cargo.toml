@@ -11,18 +11,14 @@ publish.workspace = true
 [dependencies]
 sentinel-core.workspace = true
 chromiumoxide.workspace = true
-tokio.workspace = true
+# `time` for the `WaitFor` action's bounded poll/timeout, and the test-side CDP timeout guard.
+tokio = { workspace = true, features = ["time"] }
 futures.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 url.workspace = true
 tracing.workspace = true
 base64.workspace = true
-
-[dev-dependencies]
-# `time` for the test-side `tokio::time::timeout` guard around CDP calls (#58) — not used by
-# the library itself.
-tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
