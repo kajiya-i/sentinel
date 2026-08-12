@@ -1,16 +1,18 @@
 //! `sentinel-browser` — `Browser` port implementation over chromiumoxide (CDP).
 //!
-//! Launches Chrome, opens the check's URL, and captures objective evidence: a PNG screenshot
-//! and the raw accessibility tree (`Accessibility.getFullAXTree`). This is the M1 minimal
-//! path — action execution, condition arrangement (Fetch interception), a11y pruning, precise
-//! viewport sizing, and full auto-wait land in M2–M3.
+//! Launches Chrome, opens the check's URL, runs the scenario's actions (goto/click/fill/wait_for,
+//! targeting accessible-name-first with a CSS fallback), and captures objective evidence: a PNG
+//! screenshot and the raw accessibility tree (`Accessibility.getFullAXTree`). Condition
+//! arrangement via CDP `Fetch` interception is wired for the minimal mock case. Still to come:
+//! a11y-tree pruning, precise viewport sizing, network-idle auto-wait (M2, T-M2-03/04/05), and
+//! the full route DSL (M3).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::accessibility::{
     EnableParams as AxEnableParams, GetFullAxTreeParams,
 };
@@ -21,10 +23,11 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::{Browser as CdpBrowser, BrowserConfig};
+use chromiumoxide::{Element, Page};
 use futures::StreamExt;
 use tokio::task::JoinHandle;
 
-use sentinel_core::{Browser, BrowserError, Check, Evidence, Scenario};
+use sentinel_core::{Action, Browser, BrowserError, Check, Evidence, Scenario};
 
 /// A minimal request-mocking rule for the walking skeleton: any intercepted request whose URL
 /// contains `url_substring` is fulfilled with `status` instead of reaching the network. The
@@ -157,17 +160,7 @@ impl ChromiumBrowser {
         scenario: &Scenario,
         mocks: &[MockRule],
     ) -> Result<Evidence, BrowserError> {
-        let target = check.url.as_str();
-        validate_scheme(target)?;
-
-        if !scenario.actions.is_empty() {
-            // Action execution arrives in M2; the minimal path captures the initial page.
-            tracing::warn!(
-                check = %check.name,
-                actions = scenario.actions.len(),
-                "scenario actions are not executed yet; capturing the initial page"
-            );
-        }
+        validate_scheme(check.url.as_str())?;
 
         let page = self
             .browser
@@ -179,53 +172,229 @@ impl ChromiumBrowser {
         let interception = if mocks.is_empty() {
             None
         } else {
-            Some(install_mocks(&page, mocks).await?)
+            match install_mocks(&page, mocks).await {
+                Ok(task) => Some(task),
+                // Close the page we just opened before bailing (#66 — cleanup on every path).
+                Err(e) => {
+                    let _ = page.close().await;
+                    return Err(e);
+                }
+            }
         };
 
-        page.goto(target)
-            .await
-            .map_err(|_| BrowserError::Navigation {
-                url: target.to_string(),
-            })?;
-        // `goto` returns once navigation is *committed*, not once the page has loaded, so a
-        // real page would be captured blank. Wait for the load event before taking evidence.
-        // Element-level auto-wait (network idle / specific selectors) is still M2.
-        page.wait_for_navigation()
-            .await
-            .map_err(|_| BrowserError::Navigation {
-                url: target.to_string(),
-            })?;
-
-        let screenshot_png = page
-            .screenshot(
-                ScreenshotParams::builder()
-                    .format(CaptureScreenshotFormat::Png)
-                    .full_page(check.full_page)
-                    .build(),
-            )
-            .await
-            .map_err(|e| BrowserError::Protocol(e.to_string()))?;
-
-        page.execute(AxEnableParams::default())
-            .await
-            .map_err(|e| BrowserError::Protocol(e.to_string()))?;
-        let tree = page
-            .execute(GetFullAxTreeParams::default())
-            .await
-            .map_err(|e| BrowserError::Protocol(e.to_string()))?;
-        let a11y_tree = serde_json::to_string(&tree.nodes)
-            .map_err(|e| BrowserError::Protocol(e.to_string()))?;
-
-        let _ = page.close().await; // best-effort; independent page per check
+        // Navigate, run the scenario's actions, and capture — then ALWAYS release the page and
+        // abort the interception task, on success and on error alike (#66). A leaked page/task
+        // would accumulate once the browser is reused across checks (M5 suite, T-M5-05).
+        let result = capture(&page, check, scenario).await;
+        let _ = page.close().await;
         if let Some(task) = interception {
             task.abort();
         }
-
-        Ok(Evidence {
-            screenshot_png,
-            a11y_tree,
-        })
+        result
     }
+}
+
+/// Default budget for a `WaitFor` action before giving up with [`BrowserError::Timeout`].
+const WAIT_FOR_TIMEOUT: Duration = Duration::from_millis(5_000);
+/// Poll interval while a `WaitFor` action waits for its target to appear.
+const WAIT_FOR_POLL: Duration = Duration::from_millis(100);
+/// Attribute/selector bridging an accessible-name match to a CSS-findable element.
+const MARKER_SELECTOR: &str = "[data-sentinel-target]";
+
+/// Navigate to the check URL, run the scenario's actions to reach the state under test, then
+/// capture evidence (screenshot + full a11y tree). Fallible on its own so
+/// [`ChromiumBrowser::collect_with_mocks`] can clean up regardless of the outcome.
+async fn capture(
+    page: &Page,
+    check: &Check,
+    scenario: &Scenario,
+) -> Result<Evidence, BrowserError> {
+    let target = check.url.as_str();
+    page.goto(target)
+        .await
+        .map_err(|_| BrowserError::Navigation {
+            url: target.to_string(),
+        })?;
+    // `goto` returns once navigation is *committed*, not once the page has loaded (RK-002), so a
+    // real page would be captured blank. Wait for load before acting/capturing. Per-action
+    // auto-wait (network idle) is still M2 (T-M2-03).
+    page.wait_for_navigation()
+        .await
+        .map_err(|_| BrowserError::Navigation {
+            url: target.to_string(),
+        })?;
+
+    for action in &scenario.actions {
+        execute_action(page, action).await?;
+    }
+
+    let screenshot_png = page
+        .screenshot(
+            ScreenshotParams::builder()
+                .format(CaptureScreenshotFormat::Png)
+                .full_page(check.full_page)
+                .build(),
+        )
+        .await
+        .map_err(|e| BrowserError::Protocol(e.to_string()))?;
+
+    page.execute(AxEnableParams::default())
+        .await
+        .map_err(|e| BrowserError::Protocol(e.to_string()))?;
+    let tree = page
+        .execute(GetFullAxTreeParams::default())
+        .await
+        .map_err(|e| BrowserError::Protocol(e.to_string()))?;
+    let a11y_tree =
+        serde_json::to_string(&tree.nodes).map_err(|e| BrowserError::Protocol(e.to_string()))?;
+
+    Ok(Evidence {
+        screenshot_png,
+        a11y_tree,
+    })
+}
+
+/// Execute one scenario action against the current page (docs/specs/core-mechanism.md — the MVP
+/// action set). Targets resolve accessible-name-first with a CSS-selector fallback ([`resolve`]).
+async fn execute_action(page: &Page, action: &Action) -> Result<(), BrowserError> {
+    match action {
+        Action::Goto { url } => {
+            let u = url.as_str();
+            validate_scheme(u)?;
+            page.goto(u)
+                .await
+                .map_err(|_| BrowserError::Navigation { url: u.to_string() })?;
+            page.wait_for_navigation()
+                .await
+                .map_err(|_| BrowserError::Navigation { url: u.to_string() })?;
+        }
+        Action::Click { target } => {
+            resolve(page, target)
+                .await?
+                .click()
+                .await
+                .map_err(|e| BrowserError::Protocol(e.to_string()))?;
+            // A click that triggers navigation isn't awaited here: bounded per-action settling
+            // (network idle / load) is auto-wait, M2 T-M2-03 (#17). Until then a `WaitFor` after
+            // a navigating click is the explicit synchronization point.
+        }
+        Action::Fill { target, value } => {
+            let el = resolve(page, target).await?;
+            // `focus` (not click) avoids firing an unrelated click handler; `type_str` appends —
+            // clearing an existing value first is a later refinement (M2 fixtures start empty).
+            el.focus()
+                .await
+                .map_err(|e| BrowserError::Protocol(e.to_string()))?;
+            el.type_str(value)
+                .await
+                .map_err(|e| BrowserError::Protocol(e.to_string()))?;
+        }
+        Action::WaitFor { target } => {
+            wait_for_target(page, target, WAIT_FOR_TIMEOUT).await?;
+        }
+        // `Action` is `#[non_exhaustive]`; a variant added later has no execution path here yet.
+        _ => {
+            return Err(BrowserError::Protocol(
+                "unsupported action variant".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Poll for a CSS `target` until it appears or `timeout` elapses ([`BrowserError::Timeout`]).
+///
+/// `WaitFor` matches by CSS selector only — existence-waiting is a selector operation, and using
+/// the accessible-name path here would re-scan the whole DOM and mutate it (the marker attribute)
+/// on every poll (RK-006). Accessible-name-based waiting is a later refinement; interaction
+/// targeting (`resolve`, used by Click/Fill) keeps accessible-name-first.
+async fn wait_for_target(page: &Page, target: &str, timeout: Duration) -> Result<(), BrowserError> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if page.find_element(target).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(WAIT_FOR_POLL).await;
+        }
+    })
+    .await
+    .map_err(|_| BrowserError::Timeout {
+        target: target.to_string(),
+        ms: timeout.as_millis() as u64,
+    })
+}
+
+/// Resolve a target string to an element: accessible-name first, then CSS selector
+/// (docs/specs/core-mechanism.md — "accessible name を第一、CSS も可"). chromiumoxide only hands
+/// out element handles via CSS, so an accessible-name match is bridged through a temporary marker
+/// attribute ([`resolve_by_accessible_name`]).
+async fn resolve(page: &Page, target: &str) -> Result<Element, BrowserError> {
+    if let Some(el) = resolve_by_accessible_name(page, target).await? {
+        return Ok(el);
+    }
+    page.find_element(target)
+        .await
+        .map_err(|_| BrowserError::ElementNotFound {
+            target: target.to_string(),
+        })
+}
+
+/// Mark the first element whose approximate accessible name equals `target` and return a handle to
+/// it, or `None` if nothing matches (so the caller falls back to CSS). The accessible name is
+/// approximated (aria-label / associated `<label>` / text / placeholder / title / alt / value);
+/// the full ARIA accname algorithm is a later refinement.
+///
+/// The mark (`evaluate`) and the handle lookup (`find_element`) are two CDP round-trips, so this is
+/// not atomic against a mutating page (RK-006): a hostile page could re-target the marker in the
+/// gap. Acceptable for M2 (self-owned targets, non-secret input); a single-round-trip resolution is
+/// required before M3 fills credentials.
+async fn resolve_by_accessible_name(
+    page: &Page,
+    target: &str,
+) -> Result<Option<Element>, BrowserError> {
+    let matched: bool = page
+        .evaluate(accname_probe_js(target)?)
+        .await
+        .map_err(|e| BrowserError::Protocol(e.to_string()))?
+        .into_value()
+        .map_err(|e| BrowserError::Protocol(e.to_string()))?;
+    if !matched {
+        return Ok(None);
+    }
+    // The marker matched but the element is gone (mutated away between round-trips) → not found.
+    page.find_element(MARKER_SELECTOR)
+        .await
+        .map(Some)
+        .map_err(|_| BrowserError::ElementNotFound {
+            target: target.to_string(),
+        })
+}
+
+/// Build the injection-safe JS expression that marks the first element whose approximate
+/// accessible name equals `target` and returns whether one was found. `target` is embedded via
+/// `serde_json` string escaping, so a hostile target string can't break out of the literal.
+fn accname_probe_js(target: &str) -> Result<String, BrowserError> {
+    let name = serde_json::to_string(target).map_err(|e| BrowserError::Protocol(e.to_string()))?;
+    Ok(format!(
+        r#"(() => {{
+  const name = {name};
+  const accName = (el) => {{
+    const aria = el.getAttribute('aria-label'); if (aria) return aria.trim();
+    if (el.labels && el.labels.length) return (el.labels[0].textContent || '').trim();
+    const ph = el.getAttribute('placeholder'); if (ph) return ph.trim();
+    const title = el.getAttribute('title'); if (title) return title.trim();
+    const alt = el.getAttribute('alt'); if (alt) return alt.trim();
+    const txt = (el.textContent || '').trim(); if (txt) return txt;
+    if ('value' in el && el.value) return String(el.value).trim();
+    return '';
+  }};
+  document.querySelectorAll('[data-sentinel-target]').forEach(e => e.removeAttribute('data-sentinel-target'));
+  for (const el of document.querySelectorAll('a,button,input,textarea,select,[role],[aria-label]')) {{
+    if (accName(el) === name) {{ el.setAttribute('data-sentinel-target', ''); return true; }}
+  }}
+  return false;
+}})()"#
+    ))
 }
 
 /// Enable CDP `Fetch` and spawn the `requestPaused` loop: matching requests are fulfilled with
@@ -449,5 +618,224 @@ mod tests {
         }
 
         browser.close().await;
+    }
+
+    // ---- Actions (#16) ----
+
+    fn check_with_actions(url: &str, actions: Vec<Action>) -> Check {
+        Check {
+            id: CheckId::new("fixture"),
+            name: "fixture".to_string(),
+            url: TargetUrl::new(url),
+            viewport: Viewport::default(),
+            full_page: false,
+            threshold: Threshold::new(0.7).expect("0.7 in range"),
+            scenarios: vec![Scenario {
+                name: "default".to_string(),
+                actions,
+                spec: "reached the target state".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn accname_probe_js_should_escape_target_string() {
+        // A hostile target must be embedded as an escaped JS string literal, not break out of it.
+        let js = accname_probe_js("a\"b").expect("built js");
+        assert!(
+            js.contains(r#"const name = "a\"b""#),
+            "quote was not JSON-escaped: {js}"
+        );
+        // Backslash and newline must also be escaped (delegated to serde_json).
+        let js2 = accname_probe_js("a\\b\nc").expect("built js");
+        assert!(
+            js2.contains(r#"const name = "a\\b\nc""#),
+            "backslash/newline not escaped: {js2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn goto_action_should_navigate_and_validate_scheme() {
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
+            eprintln!("skipping: no chrome available");
+            return;
+        };
+        // Start on page A, then a `goto` action navigates to page B; evidence must reflect B.
+        let check = check_with_actions(
+            "data:text/html,<h1>page-A</h1>",
+            vec![Action::Goto {
+                url: TargetUrl::new("data:text/html,<h1>page-B</h1>"),
+            }],
+        );
+        let evidence = tokio::time::timeout(
+            CDP_TEST_TIMEOUT,
+            browser.collect_evidence(&check, &check.scenarios[0]),
+        )
+        .await
+        .expect("collect timed out")
+        .expect("evidence captured");
+        browser.close().await;
+        let a11y = evidence.a11y_tree.to_lowercase();
+        assert!(a11y.contains("page-b"), "goto did not navigate to B");
+        assert!(!a11y.contains("page-a"), "still on A after goto");
+    }
+
+    #[tokio::test]
+    async fn goto_action_should_reject_non_web_scheme() {
+        // The scheme gate fires on action URLs too (SSRF/scheme, docs/rules/security.md §2).
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
+            eprintln!("skipping: no chrome available");
+            return;
+        };
+        let page = browser.browser.new_page("about:blank").await.expect("page");
+        let result = execute_action(
+            &page,
+            &Action::Goto {
+                url: TargetUrl::new("file:///etc/passwd"),
+            },
+        )
+        .await;
+        let _ = page.close().await;
+        browser.close().await;
+        assert!(matches!(
+            result,
+            Err(BrowserError::UnsupportedScheme { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn click_action_should_change_page_state() {
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
+            eprintln!("skipping: no chrome available");
+            return;
+        };
+        // The button (resolved by accessible name "Go") flips #o from "todo" to "DONE" on click.
+        let check = check_with_actions(
+            "data:text/html,<button id=b>Go</button><p id=o>todo</p>\
+             <script>document.getElementById('b').onclick=()=>{document.getElementById('o').textContent='DONE'}</script>",
+            vec![Action::Click {
+                target: "Go".to_string(),
+            }],
+        );
+        let evidence = tokio::time::timeout(
+            CDP_TEST_TIMEOUT,
+            browser.collect_evidence(&check, &check.scenarios[0]),
+        )
+        .await
+        .expect("collect timed out")
+        .expect("evidence captured");
+        browser.close().await;
+        assert!(
+            evidence.a11y_tree.to_lowercase().contains("done"),
+            "click did not update the page state"
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_action_should_set_value_by_name_and_css() {
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
+            eprintln!("skipping: no chrome available");
+            return;
+        };
+        // Two inputs mirror their value into #o on input. Fill one by accessible name (its
+        // <label>), the other by CSS selector.
+        let check = check_with_actions(
+            "data:text/html,<label for=e1>Email</label><input id=e1><input id=e2><p id=o></p>\
+             <script>function m(){document.getElementById('o').textContent=document.getElementById('e1').value+'|'+document.getElementById('e2').value}\
+             document.getElementById('e1').oninput=m;document.getElementById('e2').oninput=m</script>",
+            vec![
+                Action::Fill {
+                    target: "Email".to_string(),
+                    value: "a@b.com".to_string(),
+                },
+                Action::Fill {
+                    target: "#e2".to_string(),
+                    value: "xyz".to_string(),
+                },
+            ],
+        );
+        let evidence = tokio::time::timeout(
+            CDP_TEST_TIMEOUT,
+            browser.collect_evidence(&check, &check.scenarios[0]),
+        )
+        .await
+        .expect("collect timed out")
+        .expect("evidence captured");
+        let a11y = evidence.a11y_tree.to_lowercase();
+        browser.close().await;
+        assert!(a11y.contains("a@b.com"), "fill-by-accessible-name failed");
+        assert!(a11y.contains("xyz"), "fill-by-css-selector failed");
+    }
+
+    #[tokio::test]
+    async fn wait_for_action_should_find_delayed_element() {
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
+            eprintln!("skipping: no chrome available");
+            return;
+        };
+        // The <div> is appended after 150ms; `wait_for` must poll until it exists.
+        let check = check_with_actions(
+            "data:text/html,<p id=o>waiting</p>\
+             <script>setTimeout(function(){var d=document.createElement('div');d.textContent='arrived';document.body.appendChild(d)},150)</script>",
+            vec![Action::WaitFor {
+                target: "div".to_string(),
+            }],
+        );
+        let evidence = tokio::time::timeout(
+            CDP_TEST_TIMEOUT,
+            browser.collect_evidence(&check, &check.scenarios[0]),
+        )
+        .await
+        .expect("collect timed out")
+        .expect("evidence captured");
+        browser.close().await;
+        assert!(
+            evidence.a11y_tree.to_lowercase().contains("arrived"),
+            "wait_for did not wait for the delayed element"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_target_should_timeout_when_absent() {
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
+            eprintln!("skipping: no chrome available");
+            return;
+        };
+        // Drive `wait_for_target` directly with a short budget so the timeout path is fast.
+        let page = tokio::time::timeout(
+            CDP_TEST_TIMEOUT,
+            browser.browser.new_page("data:text/html,<p>x</p>"),
+        )
+        .await
+        .expect("new_page timed out")
+        .expect("page");
+        let result = wait_for_target(&page, "#never", Duration::from_millis(100)).await;
+        let _ = page.close().await;
+        browser.close().await;
+        assert!(matches!(result, Err(BrowserError::Timeout { .. })));
+    }
+
+    #[tokio::test]
+    async fn click_action_should_error_when_target_absent() {
+        // A missing target is a typed `ElementNotFound`, not a panic — the fail-soft path so the
+        // check becomes verdict=error rather than aborting the run.
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
+            eprintln!("skipping: no chrome available");
+            return;
+        };
+        let check = check_with_actions(
+            "data:text/html,<p>no button here</p>",
+            vec![Action::Click {
+                target: "#nope".to_string(),
+            }],
+        );
+        let result = tokio::time::timeout(
+            CDP_TEST_TIMEOUT,
+            browser.collect_evidence(&check, &check.scenarios[0]),
+        )
+        .await
+        .expect("collect timed out");
+        browser.close().await;
+        assert!(matches!(result, Err(BrowserError::ElementNotFound { .. })));
     }
 }
