@@ -2,11 +2,13 @@
 //!
 //! Launches Chrome, opens the check's URL, runs the scenario's actions (goto/click/fill/wait_for,
 //! targeting accessible-name-first with a CSS fallback), and captures objective evidence: a PNG
-//! screenshot and the raw accessibility tree (`Accessibility.getFullAXTree`). Condition
-//! arrangement via CDP `Fetch` interception is wired for the minimal mock case. Still to come:
-//! a11y-tree pruning, precise viewport sizing, network-idle auto-wait (M2, T-M2-03/04/05), and
-//! the full route DSL (M3).
+//! screenshot and the raw accessibility tree (`Accessibility.getFullAXTree`). Capture waits for
+//! the page to settle first — bounded navigation + network-idle + `readyState` (evidence-first).
+//! Condition arrangement via CDP `Fetch` interception is wired for the minimal mock case. Still
+//! to come: a11y-tree pruning and precise viewport sizing / screenshot downscale (M2,
+//! T-M2-04/05), frozen evidence (T-M2-06), and the full route DSL (M3).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -20,7 +22,12 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
     ContinueRequestParams, EnableParams as FetchEnableParams, EventRequestPaused,
     FulfillRequestParams, HeaderEntry,
 };
+use chromiumoxide::cdp::browser_protocol::network::{
+    EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
+    EventRequestWillBeSent, RequestId,
+};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::listeners::EventStream;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::{Browser as CdpBrowser, BrowserConfig};
 use chromiumoxide::{Element, Page};
@@ -201,6 +208,17 @@ const WAIT_FOR_POLL: Duration = Duration::from_millis(100);
 /// Attribute/selector bridging an accessible-name match to a CSS-findable element.
 const MARKER_SELECTOR: &str = "[data-sentinel-target]";
 
+/// Overall budget for a single navigation (`goto` + load). chromiumoxide's `wait_for_navigation`
+/// has no timeout of its own, so this bounds it (RK-002/RK-003). Fixed for M2; user config is M5.
+const NAV_TIMEOUT: Duration = Duration::from_secs(15);
+/// Overall budget for waiting on network-idle before capturing evidence.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// In-flight requests must stay `<= NETWORK_IDLE_THRESHOLD` this long to count as network-idle.
+const NETWORK_QUIET: Duration = Duration::from_millis(500);
+/// Playwright-style network-idle threshold: `<= 2` in-flight tolerates keep-alive/analytics that
+/// never fully drain to zero.
+const NETWORK_IDLE_THRESHOLD: usize = 2;
+
 /// Navigate to the check URL, run the scenario's actions to reach the state under test, then
 /// capture evidence (screenshot + full a11y tree). Fallible on its own so
 /// [`ChromiumBrowser::collect_with_mocks`] can clean up regardless of the outcome.
@@ -209,24 +227,22 @@ async fn capture(
     check: &Check,
     scenario: &Scenario,
 ) -> Result<Evidence, BrowserError> {
-    let target = check.url.as_str();
-    page.goto(target)
-        .await
-        .map_err(|_| BrowserError::Navigation {
-            url: target.to_string(),
-        })?;
-    // `goto` returns once navigation is *committed*, not once the page has loaded (RK-002), so a
-    // real page would be captured blank. Wait for load before acting/capturing. Per-action
-    // auto-wait (network idle) is still M2 (T-M2-03).
-    page.wait_for_navigation()
-        .await
-        .map_err(|_| BrowserError::Navigation {
-            url: target.to_string(),
-        })?;
+    // Start counting network activity *before* navigating: `wait_for_navigation` resolves at the
+    // `load` event, not network-idle, and CDP `Network.enable` doesn't replay requests that began
+    // before it. Enabling here means a fetch kicked off on load (the async-data / error-UI case
+    // this feature exists for) is observed, instead of being missed and captured mid-flight.
+    let streams = enable_network(page).await?;
+
+    navigate(page, check.url.as_str()).await?;
 
     for action in &scenario.actions {
         execute_action(page, action).await?;
     }
+
+    // Settle before capturing: evidence is only ground truth if taken after the page is quiet
+    // (docs/specs/ai-judgment.md — evidence-first). This also covers a navigating click (a click
+    // in `execute_action` isn't awaited there; the settle here waits for the new page).
+    wait_for_settled(page, streams, SETTLE_TIMEOUT).await?;
 
     let screenshot_png = page
         .screenshot(
@@ -254,6 +270,125 @@ async fn capture(
     })
 }
 
+/// Navigate to `url` and wait for the load event, bounded by [`NAV_TIMEOUT`]. `goto` returns on
+/// navigation *commit*, not load, so `wait_for_navigation` is required (RK-002); neither has a
+/// timeout of its own, so the whole step is wrapped (RK-003). Elapse → [`BrowserError::Timeout`].
+async fn navigate(page: &Page, url: &str) -> Result<(), BrowserError> {
+    let nav = async {
+        page.goto(url).await.map_err(|_| BrowserError::Navigation {
+            url: url.to_string(),
+        })?;
+        page.wait_for_navigation()
+            .await
+            .map_err(|_| BrowserError::Navigation {
+                url: url.to_string(),
+            })?;
+        Ok::<(), BrowserError>(())
+    };
+    match tokio::time::timeout(NAV_TIMEOUT, nav).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(BrowserError::Timeout {
+            target: url.to_string(),
+            ms: NAV_TIMEOUT.as_millis() as u64,
+        }),
+    }
+}
+
+/// The CDP `Network` event streams used to detect network-idle, produced by [`enable_network`]
+/// before navigation and consumed by [`wait_for_settled`] afterwards.
+struct NetworkStreams {
+    sent: EventStream<EventRequestWillBeSent>,
+    finished: EventStream<EventLoadingFinished>,
+    failed: EventStream<EventLoadingFailed>,
+}
+
+/// Register the `Network` request listeners and enable the domain. Call this *before* navigating:
+/// `Network.enable` does not replay requests that began earlier, so a fetch started on `load`
+/// would otherwise be invisible to the settle loop. Listeners are registered before `enable`, or
+/// early events are missed (RK-003).
+async fn enable_network(page: &Page) -> Result<NetworkStreams, BrowserError> {
+    let sent = page
+        .event_listener::<EventRequestWillBeSent>()
+        .await
+        .map_err(|e| BrowserError::Protocol(e.to_string()))?;
+    let finished = page
+        .event_listener::<EventLoadingFinished>()
+        .await
+        .map_err(|e| BrowserError::Protocol(e.to_string()))?;
+    let failed = page
+        .event_listener::<EventLoadingFailed>()
+        .await
+        .map_err(|e| BrowserError::Protocol(e.to_string()))?;
+    page.execute(NetworkEnableParams::default())
+        .await
+        .map_err(|e| BrowserError::Protocol(e.to_string()))?;
+    Ok(NetworkStreams {
+        sent,
+        finished,
+        failed,
+    })
+}
+
+/// Wait until the page is settled — network-idle (`<= NETWORK_IDLE_THRESHOLD` in-flight requests
+/// sustained for [`NETWORK_QUIET`]) *and* `document.readyState === "complete"` — bounded by
+/// `timeout`, over the streams [`enable_network`] opened before navigation. This is the
+/// evidence-first gate: capturing before the async data/error UI has rendered yields false
+/// verdicts. Elapse → [`BrowserError::Timeout`] (a never-idle page fails fast instead of hanging —
+/// "critical for timeout scenarios"). Coexists with `install_mocks`: a fulfilled request still
+/// fires `requestWillBeSent` then `loadingFinished`, so it leaves the in-flight set.
+async fn wait_for_settled(
+    page: &Page,
+    mut streams: NetworkStreams,
+    timeout: Duration,
+) -> Result<(), BrowserError> {
+    let settle = async {
+        // Track in-flight requests by `RequestId` rather than a counter: a redirect re-fires
+        // `requestWillBeSent` under the *same* id (idempotent insert) but finishes only once, and
+        // an id we never saw start (began before enable) just misses on removal — both of which a
+        // bare +1/-1 counter would mishandle.
+        let mut in_flight: HashSet<RequestId> = HashSet::new();
+        loop {
+            tokio::select! {
+                ev = streams.sent.next() => match ev {
+                    Some(e) => { in_flight.insert(e.request_id.clone()); }
+                    None => return Ok(()), // stream ended (page gone) — nothing left to wait on
+                },
+                ev = streams.finished.next() => match ev {
+                    Some(e) => { in_flight.remove(&e.request_id); }
+                    None => return Ok(()),
+                },
+                ev = streams.failed.next() => match ev {
+                    Some(e) => { in_flight.remove(&e.request_id); }
+                    None => return Ok(()),
+                },
+                // Quiet window: only armed while the network is idle. A new request restarts it.
+                _ = tokio::time::sleep(NETWORK_QUIET), if in_flight.len() <= NETWORK_IDLE_THRESHOLD => {
+                    if document_ready(page).await? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    };
+
+    match tokio::time::timeout(timeout, settle).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(BrowserError::Timeout {
+            target: "network-idle".to_string(),
+            ms: timeout.as_millis() as u64,
+        }),
+    }
+}
+
+/// Whether the document has finished parsing (`readyState === "complete"`).
+async fn document_ready(page: &Page) -> Result<bool, BrowserError> {
+    page.evaluate("document.readyState === \"complete\"")
+        .await
+        .map_err(|e| BrowserError::Protocol(e.to_string()))?
+        .into_value()
+        .map_err(|e| BrowserError::Protocol(e.to_string()))
+}
+
 /// Execute one scenario action against the current page (docs/specs/core-mechanism.md — the MVP
 /// action set). Targets resolve accessible-name-first with a CSS-selector fallback ([`resolve`]).
 async fn execute_action(page: &Page, action: &Action) -> Result<(), BrowserError> {
@@ -261,12 +396,7 @@ async fn execute_action(page: &Page, action: &Action) -> Result<(), BrowserError
         Action::Goto { url } => {
             let u = url.as_str();
             validate_scheme(u)?;
-            page.goto(u)
-                .await
-                .map_err(|_| BrowserError::Navigation { url: u.to_string() })?;
-            page.wait_for_navigation()
-                .await
-                .map_err(|_| BrowserError::Navigation { url: u.to_string() })?;
+            navigate(page, u).await?;
         }
         Action::Click { target } => {
             resolve(page, target)
@@ -837,5 +967,81 @@ mod tests {
         .expect("collect timed out");
         browser.close().await;
         assert!(matches!(result, Err(BrowserError::ElementNotFound { .. })));
+    }
+
+    // ---- auto-wait / settle (#17) ----
+
+    #[tokio::test]
+    async fn wait_for_settled_should_return_when_network_quiets() {
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
+            eprintln!("skipping: no chrome available");
+            return;
+        };
+        let page = tokio::time::timeout(CDP_TEST_TIMEOUT, browser.browser.new_page("about:blank"))
+            .await
+            .expect("new_page timed out")
+            .expect("page");
+        let streams = enable_network(&page).await.expect("enable network");
+        navigate(&page, "data:text/html,<h1>static</h1>")
+            .await
+            .expect("nav");
+        // No network activity → settles within the quiet window, well under the budget.
+        let result = tokio::time::timeout(
+            CDP_TEST_TIMEOUT,
+            wait_for_settled(&page, streams, SETTLE_TIMEOUT),
+        )
+        .await
+        .expect("settle timed out");
+        let _ = page.close().await;
+        browser.close().await;
+        assert!(result.is_ok(), "static page did not settle: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_settled_should_time_out_with_tiny_budget() {
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
+            eprintln!("skipping: no chrome available");
+            return;
+        };
+        let page = tokio::time::timeout(CDP_TEST_TIMEOUT, browser.browser.new_page("about:blank"))
+            .await
+            .expect("new_page timed out")
+            .expect("page");
+        let streams = enable_network(&page).await.expect("enable network");
+        navigate(&page, "data:text/html,<h1>x</h1>")
+            .await
+            .expect("nav");
+        // 1ms is far below the 500ms quiet window, so settling can't complete in the budget.
+        let result = wait_for_settled(&page, streams, Duration::from_millis(1)).await;
+        let _ = page.close().await;
+        browser.close().await;
+        assert!(matches!(result, Err(BrowserError::Timeout { .. })));
+    }
+
+    #[tokio::test]
+    async fn auto_wait_should_capture_post_load_async_content() {
+        let Ok(browser) = ChromiumBrowser::launch(LaunchOptions::default()).await else {
+            eprintln!("skipping: no chrome available");
+            return;
+        };
+        // Content appended ~100ms after load; the 500ms settle window includes it, so capturing
+        // at raw load would miss it.
+        let check = check_with_actions(
+            "data:text/html,<p>loading</p>\
+             <script>setTimeout(function(){var p=document.createElement('p');p.textContent='late-content';document.body.appendChild(p)},100)</script>",
+            Vec::new(),
+        );
+        let evidence = tokio::time::timeout(
+            CDP_TEST_TIMEOUT,
+            browser.collect_evidence(&check, &check.scenarios[0]),
+        )
+        .await
+        .expect("collect timed out")
+        .expect("evidence captured");
+        browser.close().await;
+        assert!(
+            evidence.a11y_tree.to_lowercase().contains("late-content"),
+            "auto-wait did not include post-load content"
+        );
     }
 }
